@@ -21,19 +21,31 @@ The script asks for:
 2. the SERVERware API key (an admin API token), which is checked right away
 3. the DT Collector upload key (`dtk_...`), which is checked right away
 
-Keys are read without echo. When SERVERware has several hosts (a cluster),
-the script lists them and asks which one to report.
+Keys are read without echo.
+
+## Which hosts are reported
+
+| SERVERware | Reported |
+|---|---|
+| Standalone | the host |
+| Mirror | the primary (active) node of the pair |
+| Cluster | every host, starting with the primary (storage) host |
+
+Each host gets its own report. In a cluster, a host that cannot be read
+(for example, one with no metrics in Prometheus) is skipped with an error,
+the other hosts are still uploaded, and the script exits with status 1.
+`--host NAME` reports only that host.
 
 ## What it does
 
 1. Reads the Observability setting in SERVERware.
 2. Enables Observability if it is disabled. This starts the SRW exporter,
    the only source of the SERVERware version.
-3. Collects the host's hardware details from the SERVERware API and its
-   Prometheus.
+3. Collects each reported host's hardware details from the SERVERware API
+   and its Prometheus.
 4. Restores Observability to its previous state (disabled again, if the
    script enabled it).
-5. Uploads the report to DT Collector and prints the report ID.
+5. Uploads the reports to DT Collector and prints each report ID.
 6. Deletes its temporary directory and exits.
 
 Observability is restored on every exit path, including errors and
@@ -44,9 +56,9 @@ SERVERware under System Settings > Observability.
 
 ```
 --controller ADDR  SERVERware controller (skips the prompt)
---host NAME        host to report (skips the host prompt on a cluster)
+--host NAME        report only this host
 --dt-url URL       DT Collector address (default: https://dtcollector.dtbicom.xyz)
---dry-run          print the report instead of uploading it (no DT Collector key needed)
+--dry-run          print the reports instead of uploading them (no DT Collector key needed)
 -h, --help         show help
 -V, --version      show the version
 ```

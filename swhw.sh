@@ -61,7 +61,8 @@ Usage: swhw.sh [options]
 Options:
   --controller ADDR  SERVERware controller: IP address, DNS name or URL
                      (http:// or https://; https is used when omitted)
-  --host NAME        SERVERware host to report (asked when there are several)
+  --host NAME        report only this host (by default: the host of a
+                     Standalone or Mirror, or every host of a Cluster)
   --dt-url URL       DT Collector address (default: ${DT_URL_DEFAULT})
   --dry-run          print the report instead of uploading it
                      (no DT Collector key needed)
@@ -315,36 +316,38 @@ check_dt_key() {
 	die "no valid DT Collector upload key"
 }
 
-# Picks the host to report: --host, the only host, or asks.
-select_host() {
-	local count i choice
+# Picks the hosts to report, one report each:
+#   standalone  the only host
+#   mirror      the only host; its active (primary) node is picked in find_node
+#   cluster     every host, the primary (STORAGE) host first
+# --host limits it to that one host.
+select_hosts() {
+	local count name
 	count=$(jq '.data | length' "$WORK/hosts.json")
 	((count > 0)) || die "SERVERware reports no hosts"
 	EDITION=$(jq -r '.data | if length > 1 then "cluster"
 		elif length == 1 and ((.[0].mirror_id // 0) > 0) then "mirror"
 		else "standalone" end' "$WORK/hosts.json")
 
-	if [[ -n $HOST_NAME ]]; then
-		jq -e --arg n "$HOST_NAME" 'any(.data[]; .name == $n)' "$WORK/hosts.json" >/dev/null ||
-			die "no host named '$HOST_NAME' (hosts: $(jq -r '[.data[].name] | join(", ")' "$WORK/hosts.json"))"
-	elif ((count == 1)); then
-		HOST_NAME=$(jq -r '.data[0].name // ""' "$WORK/hosts.json")
+	HOSTS=()
+	if [[ -n $HOST_ONLY ]]; then
+		jq -e --arg n "$HOST_ONLY" 'any(.data[]; .name == $n)' "$WORK/hosts.json" >/dev/null ||
+			die "no host named '$HOST_ONLY' (hosts: $(jq -r '[.data[].name] | join(", ")' "$WORK/hosts.json"))"
+		HOSTS=("$HOST_ONLY")
 	else
-		info "This SERVERware has ${count} hosts:"
-		jq -r '.data | to_entries[] | "      \(.key + 1)) \(.value.name)  (\(.value.platform_details.cpu_model // "unknown CPU"))"' \
-			"$WORK/hosts.json" >&2
-		for i in 1 2 3; do
-			prompt choice "Host to report [1-${count}]"
-			if [[ $choice =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= count)); then
-				HOST_NAME=$(jq -r --argjson i "$((choice - 1))" '.data[$i].name // ""' "$WORK/hosts.json")
-				break
-			fi
-			err "enter a number from 1 to ${count}"
-		done
+		while IFS= read -r name; do
+			[[ -n $name ]] && HOSTS+=("$name")
+		done < <(jq -r '.data | sort_by(if .purpose == "STORAGE" then 0 else 1 end, .id // 0)[] | .name // ""' "$WORK/hosts.json")
 	fi
-	[[ -n $HOST_NAME ]] || die "no host selected"
-	jq --arg n "$HOST_NAME" 'first(.data[] | select(.name == $n))' "$WORK/hosts.json" >"$WORK/host.json"
-	ok "host ${HOST_NAME} (${EDITION})"
+	((${#HOSTS[@]} > 0)) || die "SERVERware reports no host names"
+
+	if ((${#HOSTS[@]} == 1)); then
+		ok "SERVERware ${EDITION}: reporting host ${HOSTS[0]}"
+	else
+		ok "SERVERware ${EDITION}: reporting ${#HOSTS[@]} hosts, one report each:"
+		jq -r '.data | sort_by(if .purpose == "STORAGE" then 0 else 1 end, .id // 0)[]
+			| "       \(.name)  (\((.purpose // "unknown") | ascii_downcase))"' "$WORK/hosts.json" >&2
+	fi
 }
 
 # Turns observability on when it's off (it runs the SRW exporter, the only
@@ -389,17 +392,23 @@ restore_observability() {
 	fi
 }
 
-# Finds the node exporter instance of the selected host. A Mirror pair
-# "Echo" has instances "Echo-1" and "Echo-2"; only the active node's
-# replication exporter (port 9163) is up.
+# Finds the node exporter instance of host HOST_NAME. A Mirror pair "Echo"
+# has instances "Echo-1" and "Echo-2"; only the active node's replication
+# exporter (port 9163) is up. Instances belonging to another host with a
+# longer name (a cluster with "Echo" and "Echo-2") are left out.
 find_node() {
 	local result
-	prom_targets || die "reading the Prometheus targets failed: $(sw_error)"
-	result=$(jq -r --arg h "$HOST_NAME" '
-		[.data.activeTargets[]?
+	prom_targets || {
+		err "reading the Prometheus targets failed: $(sw_error)"
+		return 1
+	}
+	result=$(jq -r --arg h "$HOST_NAME" --slurpfile hosts "$WORK/hosts.json" '
+		def mine($n): . == $n or startswith($n + "-");
+		[$hosts[0].data[].name // "" | select(length > ($h | length) and mine($h))] as $longer
+		| [.data.activeTargets[]?
 		 | {i: (.labels.instance // ""), h: (.health // ""),
 		    p: ((.scrapeUrl // "") | (capture("^[^/]+//[^/]*:(?<p>[0-9]+)") // {p: ""}).p)}
-		 | select(.i == $h or (.i | startswith($h + "-")))] as $t
+		 | select((.i | mine($h)) and (.i as $i | any($longer[]; . as $o | $i | mine($o)) | not))] as $t
 		| ([$t[] | select(.p == "9100" and .h == "up") | .i] | unique) as $nodes
 		| [$t[] | select(.p == "9163" and .h == "up") | .i] as $repl
 		| if ($nodes | length) == 1 then "OK \($nodes[0])"
@@ -409,8 +418,14 @@ find_node() {
 		  else "NONE" end' "$WORK/targets.json")
 	case $result in
 	OK\ *) NODE=${result#OK } ;;
-	MULTI\ *) die "host ${HOST_NAME} has several nodes (${result#MULTI }) and none can be identified as the active one" ;;
-	*) die "Prometheus has no node exporter for host ${HOST_NAME}" ;;
+	MULTI\ *)
+		err "host ${HOST_NAME} has several nodes (${result#MULTI }) and none can be identified as the active one"
+		return 1
+		;;
+	*)
+		err "Prometheus has no node exporter for host ${HOST_NAME}"
+		return 1
+		;;
 	esac
 }
 
@@ -420,8 +435,10 @@ collect_hardware() {
 	n=${n//\"/\\\"}
 	sel="{instance=\"$n\"}"
 
-	prom threads "count(node_cpu_seconds_total{mode=\"idle\",instance=\"$n\"})" ||
-		die "querying Prometheus failed: $(sw_error)"
+	prom threads "count(node_cpu_seconds_total{mode=\"idle\",instance=\"$n\"})" || {
+		err "querying Prometheus failed: $(sw_error)"
+		return 1
+	}
 	prom sockets "count(count by (package) (node_cpu_core_throttles_total$sel))"
 	prom cores "count(count by (package, core) (node_cpu_core_throttles_total$sel))"
 	prom maxhz "max(node_cpu_frequency_max_hertz$sel)"
@@ -451,7 +468,7 @@ new_uuid() {
 # the collected data. Only the labels named below are read; serial numbers,
 # asset tags and UUIDs in node_dmi_info are ignored.
 build_report() {
-	local report_id=$1 created
+	local report_id=$1 out=$2 created
 	created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 	jq -n \
 		--arg id "$report_id" --arg created "$created" --arg edition "$EDITION" \
@@ -539,7 +556,7 @@ build_report() {
 			pbxware: []
 		},
 		tests: []
-	  }' >"$WORK/report.json"
+	  }' >"$out"
 }
 
 print_summary() {
@@ -553,34 +570,42 @@ print_summary() {
 		  "    Disks:       \($h.disks | length)",
 		  "    Storage:     \($h.storage_controllers | map("\(.count) x \(.vendor) \(.product)") | join("; ") | if . == "" then "none reported" else . end)",
 		  "    NICs:        \($h.nics | map("\(.count) x \(.vendor) \(.product) (\(.speed_mbps) Mbit/s)") | join("; ") | if . == "" then "none reported" else . end)"' \
-		"$WORK/report.json" >&2
+		"$1" >&2
 }
 
-# Uploads the report, retrying network errors and 5xx answers. Retries
-# reuse the same report_id, which DT Collector deduplicates.
+# upload_report FILE HOST: uploads one report, retrying network errors and 5xx
+# answers. Retries reuse the same report_id, which DT Collector
+# deduplicates. Returns 1 when this report failed; a rejected key stops
+# the script.
 upload_report() {
-	local file="$WORK/report.json" attempt delay=2
+	local file=$1 attempt delay=2
 	local args=(-sS -K "$WORK/dt.cfg" -X POST -H 'Content-Type: application/json'
 		-o "$WORK/resp" -w '%{http_code}' --connect-timeout 15 --max-time 120)
 	if command -v gzip >/dev/null 2>&1; then
-		gzip -c "$WORK/report.json" >"$WORK/report.json.gz"
-		file="$WORK/report.json.gz"
+		gzip -c "$1" >"$1.gz"
+		file="$1.gz"
 		args+=(-H 'Content-Encoding: gzip')
 	fi
 	for attempt in 1 2 3 4; do
 		HTTP_CODE=$(curl "${args[@]}" --data-binary "@$file" "$DT_URL/api/v1/reports" 2>"$WORK/curl.err") || HTTP_CODE=000
 		case $HTTP_CODE in
 		201)
-			ok "report uploaded"
+			ok "$2: report uploaded"
 			return 0
 			;;
 		200)
-			ok "report was already stored"
+			ok "$2: report was already stored"
 			return 0
 			;;
-		400) die "DT Collector rejected the report: $(jq -r '.error // empty' "$WORK/resp" 2>/dev/null)" ;;
+		400)
+			err "$2: DT Collector rejected the report: $(jq -r '.error // empty' "$WORK/resp" 2>/dev/null)"
+			return 1
+			;;
 		401 | 403) die "DT Collector rejected the upload key" ;;
-		413) die "the report is too large for DT Collector" ;;
+		413)
+			err "$2: the report is too large for DT Collector"
+			return 1
+			;;
 		esac
 		if ((attempt < 4)); then
 			if [[ $HTTP_CODE == 000 ]]; then
@@ -592,14 +617,41 @@ upload_report() {
 			((delay *= 2))
 		fi
 	done
-	die "uploading the report failed (HTTP $HTTP_CODE)"
+	err "$2: uploading the report failed (HTTP $HTTP_CODE)"
+	return 1
+}
+
+# collect_host NAME OUT: collects one host's hardware into report file OUT.
+# Returns 1 (after printing why) when the host can't be reported.
+collect_host() {
+	HOST_NAME=$1
+	jq --arg n "$HOST_NAME" 'first(.data[] | select(.name == $n))' "$WORK/hosts.json" >"$WORK/host.json"
+	find_node || return 1
+	collect_hardware || return 1
+	build_report "$(new_uuid)" "$2" || {
+		err "building the report for host ${HOST_NAME} failed"
+		return 1
+	}
+	if [[ -z $(jq -r '.environment.host.cpu_model' "$2") ]]; then
+		err "SERVERware reports no CPU model for host ${HOST_NAME}; it is not reported"
+		return 1
+	fi
+	if [[ $(jq -r '.environment.host.cpu_threads' "$2") == 0 ]]; then
+		err "Prometheus has no CPU metrics for host ${HOST_NAME}; it is not reported"
+		return 1
+	fi
+	ok "hardware details collected"
+	print_summary "$2"
 }
 
 # --- main -----------------------------------------------------------------
 
 main() {
-	local dry_run=0 report_id
+	local dry_run=0 i n file id
+	local reports=() report_hosts=() failed=() uploaded=()
+	HOST_ONLY=""
 	HOST_NAME=""
+	HOSTS=()
 	DT_URL=${DT_URL:-$DT_URL_DEFAULT}
 	SW_BASE=""
 	EDITION=""
@@ -615,10 +667,10 @@ main() {
 		--controller=*) SW_CONTROLLER=${1#*=} ;;
 		--host)
 			[[ $# -ge 2 ]] || die "--host needs a value"
-			HOST_NAME=$2
+			HOST_ONLY=$2
 			shift
 			;;
-		--host=*) HOST_NAME=${1#*=} ;;
+		--host=*) HOST_ONLY=${1#*=} ;;
 		--dt-url)
 			[[ $# -ge 2 ]] || die "--dt-url needs a value"
 			DT_URL=$2
@@ -661,36 +713,65 @@ main() {
 		check_dt_key
 	fi
 
-	step "Selecting the host"
-	select_host
+	step "Hosts"
+	select_hosts
 
 	step "Observability"
 	enable_observability
 
-	step "Collecting hardware details"
-	find_node
-	collect_hardware
-	report_id=$(new_uuid)
-	build_report "$report_id" || die "building the report failed"
-	[[ -n $(jq -r '.environment.host.cpu_model' "$WORK/report.json") ]] ||
-		die "SERVERware reports no CPU model for host ${HOST_NAME}; the report was not uploaded"
-	[[ $(jq -r '.environment.host.cpu_threads' "$WORK/report.json") != 0 ]] ||
-		die "Prometheus has no CPU metrics for host ${HOST_NAME}; the report was not uploaded"
-	ok "hardware details collected"
-	print_summary
+	n=${#HOSTS[@]}
+	for ((i = 0; i < n; i++)); do
+		if ((n > 1)); then
+			step "Collecting hardware details: ${HOSTS[i]} ($((i + 1))/${n})"
+		else
+			step "Collecting hardware details"
+		fi
+		file="$WORK/report-$((i + 1)).json"
+		if collect_host "${HOSTS[i]}" "$file"; then
+			reports+=("$file")
+			report_hosts+=("${HOSTS[i]}")
+		else
+			failed+=("${HOSTS[i]}")
+		fi
+	done
 
 	# Collection is done: put Observability back before uploading.
 	restore_observability
 
+	((${#reports[@]} > 0)) || die "no host could be reported, nothing was uploaded"
+
 	if ((dry_run)); then
-		cat "$WORK/report.json"
+		for file in "${reports[@]}"; do
+			cat "$file"
+		done
 		step "Dry run finished, nothing was uploaded"
+		if ((${#failed[@]} > 0)); then
+			warn "not reported: ${failed[*]}"
+			return 1
+		fi
 		return 0
 	fi
 
 	step "Uploading to DT Collector"
-	upload_report
-	printf '\n%sSuccess:%s hardware report %s uploaded to %s\n' "$C_GREEN" "$C_RESET" "$report_id" "$DT_URL" >&2
+	for ((i = 0; i < ${#reports[@]}; i++)); do
+		id=$(jq -r '.report_id' "${reports[i]}")
+		if upload_report "${reports[i]}" "${report_hosts[i]}"; then
+			uploaded+=("${report_hosts[i]}: $id")
+		else
+			failed+=("${report_hosts[i]}")
+		fi
+	done
+
+	printf '\n' >&2
+	if ((${#uploaded[@]} > 0)); then
+		printf '%sSuccess:%s %d hardware report(s) uploaded to %s\n' "$C_GREEN" "$C_RESET" "${#uploaded[@]}" "$DT_URL" >&2
+		printf '    %s\n' "${uploaded[@]}" >&2
+	fi
+	if ((${#failed[@]} > 0)); then
+		warn "not reported: ${failed[*]}"
+		return 1
+	fi
+	return 0
 }
 
 main "$@"
