@@ -5,6 +5,9 @@ to DT Collector as a hardware-only report. It needs no installation and no
 PBXware access: only a SERVERware admin API token and a DT Collector upload
 key.
 
+**Requires SERVERware 5.0 or newer.** Older versions do not have the
+Observability feature the script relies on.
+
 ## Run
 
 From any Linux shell that can reach the SERVERware controller over HTTPS
@@ -18,7 +21,9 @@ The script asks for:
 
 1. the SERVERware controller: an IP address, DNS name, or URL
    (`https://10.1.101.10`, `http://sw.example.com` and `10.1.101.10` all work)
-2. the SERVERware API key (an admin API token), which is checked right away
+2. the SERVERware API key (an admin API token), which is checked right away,
+   followed by the SERVERware version check: on versions older than 5.0 the
+   script stops here, before changing anything
 3. the DT Collector upload key (`dtk_...`), which is checked right away
 
 Keys are read without echo.
@@ -74,6 +79,9 @@ The prompts can also be answered through environment variables:
 
 ## Requirements
 
+- SERVERware 5.0 or newer. The version is read from the controller
+  (`/api/system-info`, the version shown in the About dialog). If it cannot
+  be read, the script checks that the Observability setting exists instead.
 - `bash` and `curl`
 - `jq` 1.5 or newer. If it is missing, the script downloads a static
   jq 1.7.1 build from GitHub into its temporary directory, verifies its

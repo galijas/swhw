@@ -18,6 +18,7 @@ set -uo pipefail
 SWHW_VERSION="1.0.0"
 SOURCE_NAME="hw-collect" # the report source name DT Collector expects
 DT_URL_DEFAULT="https://dtcollector.dtbicom.xyz"
+MIN_SW_MAJOR=5 # Observability, which this script needs, was added in SERVERware 5.0
 
 JQ_VERSION="1.7.1"
 JQ_SHA256_AMD64="5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5"
@@ -289,6 +290,44 @@ check_sw_token() {
 		token=""
 	done
 	die "no valid SERVERware API key"
+}
+
+# unsupported_version VERSION|"": cancels the run on SERVERware older than 5.0.
+unsupported_version() {
+	printf '\n' >&2
+	if [[ -n $1 ]]; then
+		err "SERVERware $1 is not supported."
+	else
+		err "this SERVERware version is not supported (it has no Observability setting)."
+	fi
+	info "swhw requires SERVERware ${MIN_SW_MAJOR}.0 or newer, which added the Observability"
+	info "feature it reads hardware details through. Nothing was changed or uploaded."
+	exit 1
+}
+
+# Cancels the run on SERVERware older than 5.0. The version comes from
+# /api/system-info (app_version, shown in the GUI's About dialog). When it
+# can't be read, the Observability setting (new in 5.0) must exist instead.
+check_sw_version() {
+	local version=""
+	sw_call GET /api/system-info
+	if [[ $HTTP_CODE == 200 ]]; then
+		version=$(jq -r '(.data // .) | .app_version // empty | tostring
+			| (capture("(?<v>[0-9]+(\\.[0-9]+)*)") | .v) // empty' "$WORK/resp" 2>/dev/null)
+	fi
+	if [[ -n $version ]]; then
+		((10#${version%%.*} >= MIN_SW_MAJOR)) || unsupported_version "$version"
+		ok "SERVERware $version is supported"
+		return 0
+	fi
+
+	sw_call GET /api/system-settings/observability
+	case $HTTP_CODE in
+	200) ok "SERVERware version not reported, but Observability is available" ;;
+	401 | 403) die "the SERVERware API key was rejected while checking the version" ;;
+	000) die "lost the connection to the controller: $(tail -n1 "$WORK/curl.err")" ;;
+	*) unsupported_version "" ;;
+	esac
 }
 
 # Asks for the DT Collector upload key until /api/v1/ping accepts it.
@@ -705,6 +744,7 @@ main() {
 	step "SERVERware controller"
 	connect_controller
 	check_sw_token
+	check_sw_version
 
 	if ((dry_run)); then
 		info "dry run: the report is printed, not uploaded"
